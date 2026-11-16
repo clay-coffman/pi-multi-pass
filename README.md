@@ -429,6 +429,36 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 | `google-gemini-cli` | Google Cloud Code Assist |
 | `google-antigravity` | Antigravity |
 
+### External pool members
+
+A pool can also rotate between providers that another extension registers
+with Pi and authenticates on its own, for example several Claude Code CLI
+logins exposed as `claude-directsdk-1`, `claude-directsdk-2` and so on. That
+extension declares them once:
+
+```ts
+import { registerExternalPoolBase, isExternalMemberExhausted } from "<pi-multi-pass>/extensions/multi-sub.ts";
+
+registerExternalPoolBase({
+  base: "claude-directsdk",            // used as the pool's baseProvider
+  displayName: "Claude Code CLI",
+  members: ["claude-directsdk-1", "claude-directsdk-2"],
+  isReady: (member) => loggedIn.has(member),   // replaces the stored-credential check
+  modelIds: () => ["claude-opus-5-5"],         // what the pool may select
+  piWillRetry: (error) => false,               // optional: does Pi retry this error itself?
+  continuationPrompt: () => "Continue from the transcript.", // optional follow-up after a switch
+});
+```
+
+A pool with `"baseProvider": "claude-directsdk"` and those members then
+behaves like any other: failover on a usage limit to the next ready member
+with the same model (the thinking level is kept), `/pool status` and
+`/subs status` show readiness, and chains can enter the pool.
+`isExternalMemberExhausted(name)` is true after a failover from that member
+found no further target, so the owning extension can mark the error
+terminal instead of letting Pi retry the same member. Multi-pass never logs
+external members in or out; that stays with their extension.
+
 ## Built-in limits support
 
 `/subs limits` uses a provider-specific checker registry.

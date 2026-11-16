@@ -363,6 +363,104 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 
 // ==========================================================================
+// External pool members
+// ==========================================================================
+//
+// A pool normally rotates between accounts that multi-pass itself registers
+// from one of the templates above. An *external* pool base is a provider
+// family that another extension registers with Pi and authenticates on its own
+// (for example, several Claude Code CLI logins exposed as providers). That
+// extension declares the base here; multi-pass then treats the members like any
+// other pool: readiness instead of stored credentials, the members' models as
+// the pool's models, failover to the next ready member on a usage limit, and
+// the usual /pool and /subs views. OAuth account management (login, logout,
+// token keeper, sharing) never applies to external members.
+
+export interface ExternalPoolBase {
+	/** Base provider name used in `PoolConfig.baseProvider`. Must not be a built-in template. */
+	base: string;
+	/** Shown where templates show their display name. */
+	displayName?: string;
+	/** Member provider names in rotation order; the caller registers them with Pi. */
+	members: string[];
+	/** Whether this member can take a request now (replaces a stored-credential check). */
+	isReady(member: string): boolean;
+	/** Model ids the pool may select; typically those every ready member serves. */
+	modelIds(): string[];
+	/**
+	 * Whether Pi will retry the failed turn by itself for this error text.
+	 * Default: multi-pass's own guess from the HTTP status in the message.
+	 */
+	piWillRetry?(errorMessage: string): boolean;
+	/**
+	 * Text to queue after switching members when Pi will not retry. Default: the
+	 * original prompt. A transport that keeps the transcript server-side should
+	 * ask to continue rather than replay the prompt.
+	 */
+	continuationPrompt?(lastUserPrompt: string): string;
+}
+
+const externalPoolBases = new Map<string, ExternalPoolBase>();
+
+/**
+ * Declare an external pool base. Returns a function that removes it again.
+ * Throws on a name clash with a built-in template, an empty or duplicated
+ * member list, or member names that are not plain provider identifiers.
+ */
+export function registerExternalPoolBase(spec: ExternalPoolBase): () => void {
+	if (!/^[a-z0-9][-a-z0-9]*$/.test(spec.base) || PROVIDER_TEMPLATES[spec.base]) {
+		throw new Error(`External pool base "${spec.base}" is invalid or clashes with a built-in provider`);
+	}
+	if (spec.members.length === 0 || spec.members.some((name) => !/^[a-z0-9][-a-z0-9]*$/.test(name))
+		|| new Set(spec.members).size !== spec.members.length) {
+		throw new Error(`External pool base "${spec.base}" needs unique, plain member names`);
+	}
+	for (const other of externalPoolBases.values()) {
+		if (other.base !== spec.base && other.members.some((name) => spec.members.includes(name))) {
+			throw new Error(`External pool member already belongs to "${other.base}"`);
+		}
+	}
+	externalPoolBases.set(spec.base, spec);
+	return () => {
+		if (externalPoolBases.get(spec.base) === spec) externalPoolBases.delete(spec.base);
+	};
+}
+
+/** The external base a member belongs to, if any. */
+function externalBaseOf(providerName: string): ExternalPoolBase | undefined {
+	for (const spec of externalPoolBases.values()) {
+		if (spec.members.includes(providerName)) return spec;
+	}
+	return undefined;
+}
+
+function externalMembers(): string[] {
+	return Array.from(externalPoolBases.values()).flatMap((spec) => spec.members);
+}
+
+/** Every name a pool may use as `baseProvider`: templates plus external bases. */
+function poolBaseProviders(): string[] {
+	return [...SUPPORTED_PROVIDERS, ...externalPoolBases.keys()];
+}
+
+function poolBaseDisplayName(baseProvider: string): string {
+	return PROVIDER_TEMPLATES[baseProvider]?.displayName
+		?? externalPoolBases.get(baseProvider)?.displayName
+		?? baseProvider;
+}
+
+/**
+ * True while the last failover for this external member found no further
+ * member or chain target. The owning extension can use this to turn a
+ * retryable-looking error into a terminal one so Pi does not repeat the
+ * same member. Cleared when the next failover attempt starts.
+ */
+export function isExternalMemberExhausted(providerName: string): boolean {
+	return activePoolManager?.isExternalCascadeExhausted(providerName) ?? false;
+}
+let activePoolManager: PoolManager | undefined;
+
+// ==========================================================================
 // Built-in quota checking
 // ==========================================================================
 
@@ -416,9 +514,7 @@ function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthSt
 		runtime?: { logout(provider: string): Promise<void> };
 		getProviderAuthStatus(provider: string): { configured: boolean };
 	};
-	if (registry.authStorage) return registry.authStorage;
-
-	return {
+	const native: AuthStorageCompat = registry.authStorage ?? {
 		hasAuth: (provider) => registry.getProviderAuthStatus(provider).configured,
 		get: (provider) => readStoredCredential(provider) as AuthStorageEntry | undefined,
 		logout: async (provider) => {
@@ -427,6 +523,16 @@ function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthSt
 			}
 			await registry.runtime.logout(provider);
 		},
+	};
+	if (externalPoolBases.size === 0) return native;
+
+	// External members have no stored credential; their owner answers readiness.
+	return {
+		hasAuth: (provider) => externalBaseOf(provider)?.isReady(provider) ?? native.hasAuth(provider),
+		get: (provider) => (externalBaseOf(provider) ? undefined : native.get(provider)),
+		logout: (provider) => externalBaseOf(provider)
+			? Promise.reject(new Error(`${provider} is managed by its own extension, not by multi-pass`))
+			: native.logout(provider),
 	};
 }
 
@@ -2631,14 +2737,15 @@ function getProjectScopedProviderNames(
 			const isExtraSubscription = effective.subscriptions.some(
 				(entry) => subProviderName(entry) === providerName,
 			);
-			const isSupportedBaseProvider = SUPPORTED_PROVIDERS.includes(providerName);
+			const isSupportedBaseProvider = SUPPORTED_PROVIDERS.includes(providerName)
+				|| externalBaseOf(providerName) !== undefined;
 			if (!isExtraSubscription && !isSupportedBaseProvider) continue;
 			push(providerName);
 		}
 		return providerNames;
 	}
 
-	for (const providerName of SUPPORTED_PROVIDERS) {
+	for (const providerName of [...SUPPORTED_PROVIDERS, ...externalMembers()]) {
 		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
@@ -2666,6 +2773,10 @@ function findSelectableModelForProvider(
 	const baseProvider = getBaseProvider(providerName);
 	if (!baseProvider) {
 		return undefined;
+	}
+	if (externalBaseOf(providerName)) {
+		// External members publish their own catalog; the first model Pi knows is the choice.
+		return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
 	}
 	for (const baseModel of minimaxBase(providerName)
 		? providerModelChoices(ctx, providerName)
@@ -2770,6 +2881,9 @@ function subscriptionLoginName(entry: SubEntry): string {
 function getBaseProvider(providerName: string): string | undefined {
 	// Direct match
 	if (PROVIDER_TEMPLATES[providerName]) return providerName;
+	if (externalPoolBases.has(providerName)) return providerName;
+	const external = externalBaseOf(providerName);
+	if (external) return external.base;
 	// Strip trailing -N
 	const match = providerName.match(/^(.+)-(\d+)$/);
 	if (match && PROVIDER_TEMPLATES[match[1]]) return match[1];
@@ -3240,6 +3354,16 @@ class PoolManager {
 	private providerToPool: Map<string, string> = new Map();
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
+	/** External member whose last failover found no further target; see isExternalMemberExhausted. */
+	private exhaustedExternalMember: string | null = null;
+
+	isExternalCascadeExhausted(providerName: string): boolean {
+		return this.exhaustedExternalMember === providerName && this.getPoolForProvider(providerName) !== undefined;
+	}
+
+	private noteExternalExhaustion(currentModel: Model<Api>): void {
+		if (externalBaseOf(currentModel.provider)) this.exhaustedExternalMember = currentModel.provider;
+	}
 	private suppressNextStartTurn = false;
 	private traceEnabled = false;
 	private routingTrace: RoutingTraceEntry[] = [];
@@ -3779,6 +3903,7 @@ class PoolManager {
 		lastUserPrompt: string | null,
 		config: MultiPassConfig,
 	): Promise<boolean> {
+		this.exhaustedExternalMember = null;
 		if (!currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
 
@@ -3823,6 +3948,7 @@ class PoolManager {
 
 		const nextCandidate = plan.candidates[0];
 		if (!nextCandidate) {
+			this.noteExternalExhaustion(currentModel);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			this.recordTrace(`failover exhausted in pool ${pool.name}`);
@@ -3831,6 +3957,7 @@ class PoolManager {
 
 		const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
 		if (!nextModel) {
+			this.noteExternalExhaustion(currentModel);
 			ctx.ui.notify(
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
 				"warning",
@@ -3841,8 +3968,14 @@ class PoolManager {
 			return false;
 		}
 
+		// A switch between external members keeps the thinking level: their catalogs
+		// are identical, so the level stays meaningful, and the user set it on purpose.
+		const keepThinking = externalBaseOf(currentModel.provider) && externalBaseOf(nextCandidate.provider)
+			? this.pi.getThinkingLevel()
+			: undefined;
 		const success = await this.pi.setModel(nextModel);
 		if (!success) {
+			this.noteExternalExhaustion(currentModel);
 			ctx.ui.notify(
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
 				"warning",
@@ -3851,6 +3984,9 @@ class PoolManager {
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
+		}
+		if (keepThinking !== undefined && this.pi.getThinkingLevel() !== keepThinking) {
+			this.pi.setThinkingLevel(keepThinking);
 		}
 
 		cascade.attemptedProviders.add(nextCandidate.provider);
@@ -3868,11 +4004,16 @@ class PoolManager {
 			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
 		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
-		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
+		// The member that failed knows its own transport: whether Pi retries the
+		// error text by itself, and what to send after the switch when it does not.
+		const failedExternal = externalBaseOf(currentModel.provider);
+		const piRetries = failedExternal?.piWillRetry?.(errorMessage) ?? piWillRetryTurn(errorMessage);
+		if (lastUserPrompt && !piRetries) {
 			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+			const followUp = failedExternal?.continuationPrompt?.(lastUserPrompt) ?? lastUserPrompt;
+			this.pi.sendUserMessage(followUp, { deliverAs: "followUp" });
 			this.recordTrace("queued follow-up because pi will not retry this error");
-		} else if (piWillRetryTurn(errorMessage)) {
+		} else if (piRetries) {
 			this.recordTrace("waiting for pi to retry the turn");
 		} else {
 			this.recordTrace("turn cannot be replayed because no prompt was captured");
@@ -3958,6 +4099,11 @@ function getSwitchableProviderOptions(
 			"base provider",
 		);
 	}
+	for (const spec of externalPoolBases.values()) {
+		for (const member of spec.members) {
+			push(member, member, `${spec.displayName ?? spec.base} member`);
+		}
+	}
 	for (const entry of allSubs) {
 		push(subProviderName(entry), subDisplayName(entry), "extra subscription");
 	}
@@ -3981,6 +4127,9 @@ function resolveSwitchTargetModel(
 	const baseProvider = getBaseProvider(providerName);
 	if (!baseProvider) {
 		return undefined;
+	}
+	if (externalBaseOf(providerName)) {
+		return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
 	}
 	for (const baseModel of minimaxBase(providerName)
 		? providerModelChoices(ctx, providerName)
@@ -4901,7 +5050,7 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
-	if (all.length === 0) {
+	if (all.length === 0 && externalPoolBases.size === 0) {
 		ctx.ui.notify("No extra subscriptions configured.", "info");
 		return;
 	}
@@ -4947,6 +5096,19 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 		);
 	}
 
+	for (const spec of externalPoolBases.values()) {
+		for (const member of spec.members) {
+			const inPools = config.pools
+				.filter((p) => p.members.includes(member))
+				.map((p) => p.name);
+			const poolInfo = inPools.length > 0 ? ` | pools: ${inPools.join(", ")}` : "";
+			const modelCount = ctx.modelRegistry.getAll().filter((model) => model.provider === member).length;
+			lines.push(
+				`${member} | ${spec.isReady(member) ? "ready" : "not ready"} | ${modelCount} models | ${spec.displayName ?? spec.base}${poolInfo}`,
+			);
+		}
+	}
+
 	await showWrappedSelect(ctx, {
 		title: "Subscription Status",
 		subtitle: "Press Enter or Escape to go back.",
@@ -4965,6 +5127,8 @@ function getAllProvidersForBase(
 	baseProvider: string,
 	allSubs: SubEntry[],
 ): string[] {
+	const external = externalPoolBases.get(baseProvider);
+	if (external) return [...external.members];
 	const providers = [baseProvider]; // original
 	for (const entry of allSubs) {
 		if (entry.provider === baseProvider) {
@@ -5258,10 +5422,7 @@ async function promptForPoolDefinition(
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-	const providerLabels = SUPPORTED_PROVIDERS.map((p) => {
-		const t = PROVIDER_TEMPLATES[p];
-		return `${p} -- ${t.displayName}`;
-	});
+	const providerLabels = poolBaseProviders().map((p) => `${p} -- ${poolBaseDisplayName(p)}`);
 
 	const selectedProvider = await ctx.ui.select("Pool base provider", providerLabels);
 	if (!selectedProvider) return undefined;
@@ -5461,6 +5622,12 @@ function getModelsForPool(pool: PoolConfig, ctx?: ExtensionContext | ExtensionCo
 	// (e.g. kimi-coding/k3.1-pro). The static catalog is kept as a fallback for
 	// code paths that run before the registry is populated.
 	const models: string[] = [];
+	const external = externalPoolBases.get(pool.baseProvider);
+	if (external) {
+		// The owner says which models the pool may select (usually the ones
+		// every ready member serves); there is no static catalog to fall back on.
+		return [...new Set(external.modelIds())];
+	}
 	if (ctx) {
 		const providers = minimaxBase(pool.baseProvider)
 			? new Set<string>([pool.baseProvider, ...pool.members])
@@ -6541,7 +6708,7 @@ async function handlePoolProject(
 		const envEntries = parseEnvConfig();
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
-			...SUPPORTED_PROVIDERS.filter((p) =>
+			...[...SUPPORTED_PROVIDERS, ...externalMembers()].filter((p) =>
 				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
@@ -7705,6 +7872,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Initialize pool manager with global pools (updated on session_start with project config)
 	const poolManager = new PoolManager(pi);
+	activePoolManager = poolManager;
 	poolManager.loadPools(config.pools);
 
 	let projectRestrictionSwitchInFlight = false;
